@@ -1,4 +1,5 @@
-import { useState, useRef } from 'react'
+import { useState, useRef, useEffect } from 'react'
+import { useNavigate, useLocation } from 'react-router-dom'
 import { Button, List, Progress, Tag, message, Space, Typography, Empty } from 'antd'
 import { UploadOutlined, AudioOutlined, ClockCircleOutlined, DeleteOutlined, EyeOutlined } from '@ant-design/icons'
 import { useMeetingStore } from '@/store'
@@ -15,10 +16,21 @@ interface UploadItem {
 }
 
 export default function AudioImport() {
+  const navigate = useNavigate()
+  const location = useLocation()
   const [uploadingItems, setUploadingItems] = useState<UploadItem[]>([])
   const { meetings, addMeeting, updateProcessingStatus, setCurrentMeeting } = useMeetingStore()
   const [dragging, setDragging] = useState(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
+
+  useEffect(() => {
+    const params = new URLSearchParams(location.search)
+    const meetingId = params.get('meetingId')
+    if (meetingId) {
+      setCurrentMeeting(meetingId)
+      navigate('/editor', { replace: true })
+    }
+  }, [location, navigate, setCurrentMeeting])
 
   const handleFileUpload = (file: File) => {
     const newItem: UploadItem = {
@@ -131,6 +143,7 @@ export default function AudioImport() {
 
   const handleViewMeeting = (meetingId: string) => {
     setCurrentMeeting(meetingId)
+    navigate('/editor')
   }
 
   return (

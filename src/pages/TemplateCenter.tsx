@@ -1,6 +1,6 @@
 import { useState, useMemo } from 'react'
-import { Card, Button, Select, Modal, Form, Input, Tabs, Radio, Tag, Typography, Space, message, Empty } from 'antd'
-import { PlusOutlined, FileTextOutlined, DownloadOutlined, StarOutlined, StarFilled } from '@ant-design/icons'
+import { Card, Button, Select, Modal, Form, Input, Tabs, Radio, Tag, Typography, Space, message, Empty, Checkbox } from 'antd'
+import { PlusOutlined, FileTextOutlined, DownloadOutlined, StarOutlined, StarFilled, SendOutlined } from '@ant-design/icons'
 import { useMeetingStore } from '@/store'
 import type { Template } from '@/types'
 import { generateId } from '@/mock/data'
@@ -14,7 +14,7 @@ const CATEGORIES = ['通用', '项目管理', '产品', '技术']
 const VARIABLE_HINTS = ['{{会议标题}}', '{{会议时间}}', '{{参会人员}}', '{{会议摘要}}', '{{讨论议题}}', '{{待办事项}}', '{{附件}}']
 
 export default function TemplateCenter() {
-  const { meetings, templates, generateMinutesByTemplate, exportMeeting } = useMeetingStore()
+  const { meetings, templates, generateMinutesByTemplate, exportMeeting, sendToParticipants } = useMeetingStore()
   const [activeTab, setActiveTab] = useState('templates')
   const [category, setCategory] = useState<string>('All')
   const [modalVisible, setModalVisible] = useState(false)
@@ -22,6 +22,11 @@ export default function TemplateCenter() {
   const [selectedMeetingId, setSelectedMeetingId] = useState<string>('')
   const [selectedTemplateId, setSelectedTemplateId] = useState<string>('')
   const [generatedContent, setGeneratedContent] = useState('')
+  const [includeSensitive, setIncludeSensitive] = useState(false)
+  const [sendModalVisible, setSendModalVisible] = useState(false)
+  const [selectedParticipants, setSelectedParticipants] = useState<string[]>([])
+  const [sending, setSending] = useState(false)
+  const [exporting, setExporting] = useState(false)
   const [form] = Form.useForm()
 
   const filteredTemplates = useMemo(() => {
@@ -87,7 +92,7 @@ export default function TemplateCenter() {
       message.warning('请选择会议和模板')
       return
     }
-    const content = generateMinutesByTemplate(selectedMeetingId, selectedTemplateId)
+    const content = generateMinutesByTemplate(selectedMeetingId, selectedTemplateId, includeSensitive)
     setGeneratedContent(content)
   }
 
@@ -96,18 +101,58 @@ export default function TemplateCenter() {
       message.warning('请先生成预览内容')
       return
     }
+    setExporting(true)
     try {
-      const content = await exportMeeting(selectedMeetingId, 'markdown')
+      const content = await exportMeeting(selectedMeetingId, 'markdown', selectedTemplateId, includeSensitive)
+      const meeting = meetings.find(m => m.id === selectedMeetingId)
+      const template = templates.find(t => t.id === selectedTemplateId)
       const blob = new Blob([content], { type: 'text/markdown' })
       const url = URL.createObjectURL(blob)
       const a = document.createElement('a')
       a.href = url
-      a.download = `会议纪要_${new Date().toLocaleDateString('zh-CN')}.md`
+      const dateStr = new Date().toLocaleDateString('zh-CN').replace(/\//g, '-')
+      const tplName = template ? `_${template.name}` : ''
+      a.download = `${meeting?.title || '会议纪要'}${tplName}_${dateStr}.md`
       a.click()
       URL.revokeObjectURL(url)
       message.success('导出成功')
     } catch {
       message.error('导出失败')
+    } finally {
+      setExporting(false)
+    }
+  }
+
+  const handleOpenSendModal = () => {
+    if (!selectedMeetingId) {
+      message.warning('请先选择会议')
+      return
+    }
+    const meeting = meetings.find(m => m.id === selectedMeetingId)
+    if (meeting) {
+      setSelectedParticipants([...meeting.participants])
+    }
+    setSendModalVisible(true)
+  }
+
+  const handleSend = async () => {
+    if (selectedParticipants.length === 0) {
+      message.warning('请至少选择一位参会人')
+      return
+    }
+    setSending(true)
+    try {
+      const success = await sendToParticipants(selectedMeetingId, selectedParticipants, selectedTemplateId)
+      if (success) {
+        message.success(`已发送给 ${selectedParticipants.length} 位参会人`)
+        setSendModalVisible(false)
+      } else {
+        message.error('发送失败')
+      }
+    } catch {
+      message.error('发送失败')
+    } finally {
+      setSending(false)
     }
   }
 
@@ -268,13 +313,30 @@ export default function TemplateCenter() {
                   title="预览"
                   size="small"
                   extra={
-                    <Button
-                      icon={<DownloadOutlined />}
-                      onClick={handleExport}
-                      disabled={!generatedContent}
-                    >
-                      导出 Markdown
-                    </Button>
+                    <Space>
+                      <Checkbox
+                        checked={includeSensitive}
+                        onChange={e => setIncludeSensitive(e.target.checked)}
+                        style={{ marginBottom: 0 }}
+                      >
+                        包含敏感内容
+                      </Checkbox>
+                      <Button
+                        icon={<SendOutlined />}
+                        onClick={handleOpenSendModal}
+                        disabled={!generatedContent}
+                      >
+                        发送参会人
+                      </Button>
+                      <Button
+                        icon={<DownloadOutlined />}
+                        onClick={handleExport}
+                        disabled={!generatedContent}
+                        loading={exporting}
+                      >
+                        导出 Markdown
+                      </Button>
+                    </Space>
                   }
                   style={{ flex: 1, display: 'flex', flexDirection: 'column' }}
                 >
@@ -369,6 +431,70 @@ export default function TemplateCenter() {
             </Space>
           </div>
         </Form>
+      </Modal>
+
+      <Modal
+        title="发送给参会人"
+        open={sendModalVisible}
+        onOk={handleSend}
+        onCancel={() => setSendModalVisible(false)}
+        okText="发送"
+        cancelText="取消"
+        confirmLoading={sending}
+        width={500}
+      >
+        <div style={{ marginBottom: 16 }}>
+          <Text strong style={{ display: 'block', marginBottom: 8 }}>
+            会议信息
+          </Text>
+          {(() => {
+            const meeting = meetings.find(m => m.id === selectedMeetingId)
+            const template = templates.find(t => t.id === selectedTemplateId)
+            return (
+              <div style={{ padding: 12, backgroundColor: '#f5f5f5', borderRadius: 8 }}>
+                <div><Text type="secondary">标题：</Text>{meeting?.title}</div>
+                <div><Text type="secondary">模板：</Text>{template?.name || '通用'}</div>
+                <div><Text type="secondary">摘要：</Text>{meeting?.summary || '无'}</div>
+              </div>
+            )
+          })()}
+        </div>
+        <div>
+          <Text strong style={{ display: 'block', marginBottom: 8 }}>
+            选择参会人
+          </Text>
+          {(() => {
+            const meeting = meetings.find(m => m.id === selectedMeetingId)
+            const allParticipants = Array.from(new Set([
+              ...(meeting?.participants || []),
+              '张三', '李四', '王五', '赵六', '钱七', '孙八'
+            ]))
+            return (
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+                {allParticipants.map(p => (
+                  <Checkbox
+                    key={p}
+                    checked={selectedParticipants.includes(p)}
+                    onChange={e => {
+                      if (e.target.checked) {
+                        setSelectedParticipants(prev => [...prev, p])
+                      } else {
+                        setSelectedParticipants(prev => prev.filter(x => x !== p))
+                      }
+                    }}
+                  >
+                    {p}
+                  </Checkbox>
+                ))}
+              </div>
+            )
+          })()}
+        </div>
+        <div style={{ marginTop: 16, padding: 12, backgroundColor: '#e6f7ff', borderRadius: 8 }}>
+          <Text type="secondary" style={{ fontSize: '12px' }}>
+            💡 将发送：会议标题、摘要、以及基于模板生成的纪要文档
+          </Text>
+        </div>
       </Modal>
     </>
   )

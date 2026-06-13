@@ -1,6 +1,7 @@
-import { useState } from 'react'
-import { List, Button, Input, Space, Typography, Tag, Checkbox, Empty, message, Modal, Divider } from 'antd'
-import { HighlightOutlined, SafetyOutlined, EditOutlined, CheckOutlined, CloseOutlined, MergeOutlined, FileTextOutlined, CalendarOutlined, UserOutlined } from '@ant-design/icons'
+import { useState, useMemo, useEffect } from 'react'
+import { useLocation } from 'react-router-dom'
+import { List, Button, Input, Space, Typography, Tag, Checkbox, Empty, message, Modal, Divider, Select } from 'antd'
+import { HighlightOutlined, SafetyOutlined, EditOutlined, CheckOutlined, CloseOutlined, MergeOutlined, FileTextOutlined, CalendarOutlined, UserOutlined, DownloadOutlined, SendOutlined, EyeInvisibleOutlined, EyeOutlined } from '@ant-design/icons'
 import { useMeetingStore } from '@/store'
 import { formatTime } from '@/mock/data'
 import type { TranscriptSegment } from '@/types'
@@ -9,13 +10,34 @@ const { Title, Text, Paragraph } = Typography
 const { TextArea } = Input
 
 export default function MinutesEditor() {
-  const { meetings, currentMeetingId, setCurrentMeeting, toggleSegmentHighlight, toggleSegmentSensitive, updateSegment, mergeTopics, generateSummary, getSpeakers } = useMeetingStore()
+  const location = useLocation()
+  const { meetings, currentMeetingId, setCurrentMeeting, toggleSegmentHighlight, toggleSegmentSensitive, updateSegment, mergeTopics, generateSummary, getSpeakers, exportMeeting, sendToParticipants, templates } = useMeetingStore()
+
+  useEffect(() => {
+    const params = new URLSearchParams(location.search)
+    const meetingId = params.get('meetingId')
+    if (meetingId && !currentMeetingId) {
+      setCurrentMeeting(meetingId)
+    } else if (!currentMeetingId && meetings.length > 0) {
+      setCurrentMeeting(meetings[0].id)
+    }
+  }, [location, currentMeetingId, meetings, setCurrentMeeting])
   const [editingId, setEditingId] = useState<string | null>(null)
   const [editContent, setEditContent] = useState('')
   const [selectedTopicIds, setSelectedTopicIds] = useState<string[]>([])
   const [mergeModalVisible, setMergeModalVisible] = useState(false)
   const [mergeTitle, setMergeTitle] = useState('')
   const [generating, setGenerating] = useState(false)
+  const [showSensitive, setShowSensitive] = useState(false)
+  const [collapsedSensitiveIds, setCollapsedSensitiveIds] = useState<Set<string>>(new Set())
+  const [exportModalVisible, setExportModalVisible] = useState(false)
+  const [exportTemplateId, setExportTemplateId] = useState<string>('')
+  const [exportIncludeSensitive, setExportIncludeSensitive] = useState(false)
+  const [exporting, setExporting] = useState(false)
+  const [sendModalVisible, setSendModalVisible] = useState(false)
+  const [sendTemplateId, setSendTemplateId] = useState<string>('')
+  const [selectedParticipants, setSelectedParticipants] = useState<string[]>([])
+  const [sending, setSending] = useState(false)
 
   const currentMeeting = meetings.find(m => m.id === currentMeetingId)
   const speakers = getSpeakers()
@@ -84,6 +106,93 @@ export default function MinutesEditor() {
     return '#fff'
   }
 
+  const maskSensitiveContent = (text: string) => {
+    return text.replace(/[\u4e00-\u9fa5a-zA-Z0-9]/g, '*')
+  }
+
+  const toggleSensitiveCollapse = (segmentId: string) => {
+    setCollapsedSensitiveIds(prev => {
+      const next = new Set(prev)
+      if (next.has(segmentId)) {
+        next.delete(segmentId)
+      } else {
+        next.add(segmentId)
+      }
+      return next
+    })
+  }
+
+  const handleOpenExportModal = () => {
+    if (!currentMeetingId) return
+    const defaultTemplate = templates.find(t => t.isDefault)
+    setExportTemplateId(defaultTemplate?.id || '')
+    setExportIncludeSensitive(false)
+    setExportModalVisible(true)
+  }
+
+  const handleExport = async () => {
+    if (!currentMeetingId) return
+    setExporting(true)
+    try {
+      const content = await exportMeeting(currentMeetingId, 'markdown', exportTemplateId || undefined, exportIncludeSensitive)
+      const meeting = meetings.find(m => m.id === currentMeetingId)
+      const template = templates.find(t => t.id === exportTemplateId)
+      const blob = new Blob([content], { type: 'text/markdown' })
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      const dateStr = new Date().toLocaleDateString('zh-CN').replace(/\//g, '-')
+      const tplName = template ? `_${template.name}` : ''
+      a.download = `${meeting?.title || '会议纪要'}${tplName}_${dateStr}.md`
+      a.click()
+      URL.revokeObjectURL(url)
+      message.success('导出成功')
+      setExportModalVisible(false)
+    } catch {
+      message.error('导出失败')
+    } finally {
+      setExporting(false)
+    }
+  }
+
+  const handleOpenSendModal = () => {
+    if (!currentMeetingId) return
+    const meeting = meetings.find(m => m.id === currentMeetingId)
+    const defaultTemplate = templates.find(t => t.isDefault)
+    setSendTemplateId(defaultTemplate?.id || '')
+    if (meeting) {
+      setSelectedParticipants([...meeting.participants])
+    }
+    setSendModalVisible(true)
+  }
+
+  const handleSend = async () => {
+    if (!currentMeetingId || selectedParticipants.length === 0) {
+      message.warning('请至少选择一位参会人')
+      return
+    }
+    setSending(true)
+    try {
+      const success = await sendToParticipants(currentMeetingId, selectedParticipants, sendTemplateId || undefined)
+      if (success) {
+        message.success(`已发送给 ${selectedParticipants.length} 位参会人`)
+        setSendModalVisible(false)
+      } else {
+        message.error('发送失败')
+      }
+    } catch {
+      message.error('发送失败')
+    } finally {
+      setSending(false)
+    }
+  }
+
+  const displayContent = useMemo(() => {
+    if (showSensitive) return null
+    const count = currentMeeting?.transcript.filter(s => s.isSensitive).length || 0
+    return count > 0 ? `已隐藏 ${count} 条敏感内容` : null
+  }, [showSensitive, currentMeeting])
+
   return (
     <>
       <div className="page-header">
@@ -91,7 +200,13 @@ export default function MinutesEditor() {
           <Title level={4} style={{ margin: 0 }}>会议纪要编辑</Title>
           <Space>
             <Button
-              type="primary"
+              icon={showSensitive ? <EyeOutlined /> : <EyeInvisibleOutlined />}
+              onClick={() => setShowSensitive(!showSensitive)}
+              disabled={!currentMeeting}
+            >
+              {showSensitive ? '显示敏感' : '隐藏敏感'}
+            </Button>
+            <Button
               icon={<FileTextOutlined />}
               onClick={handleGenerateSummary}
               loading={generating}
@@ -99,8 +214,30 @@ export default function MinutesEditor() {
             >
               生成摘要
             </Button>
+            <Button
+              icon={<SendOutlined />}
+              onClick={handleOpenSendModal}
+              disabled={!currentMeeting}
+            >
+              发送参会人
+            </Button>
+            <Button
+              type="primary"
+              icon={<DownloadOutlined />}
+              onClick={handleOpenExportModal}
+              disabled={!currentMeeting}
+            >
+              导出文档
+            </Button>
           </Space>
         </div>
+        {displayContent && (
+          <div style={{ marginTop: 8, padding: '8px 12px', backgroundColor: '#fff7e6', borderRadius: 4, border: '1px solid #ffd591' }}>
+            <Text type="warning" style={{ fontSize: '12px' }}>
+              🔒 {displayContent}，点击"显示敏感"可查看原文（编辑时可见）
+            </Text>
+          </div>
+        )}
       </div>
 
       <div className="page-body" style={{ display: 'flex', height: 'calc(100vh - 140px)', gap: '16px' }}>
@@ -164,6 +301,37 @@ export default function MinutesEditor() {
                   <Space direction="vertical" size={12} style={{ width: '100%' }}>
                     {currentMeeting.transcript.map((segment) => {
                       const speaker = getSpeaker(segment.speakerId)
+                      const isSensitive = segment.isSensitive
+                      const shouldMask = isSensitive && !showSensitive
+                      const isCollapsed = isSensitive && collapsedSensitiveIds.has(segment.id) && !showSensitive
+                      
+                      if (shouldMask && isCollapsed) {
+                        return (
+                          <div
+                            key={segment.id}
+                            style={{
+                              padding: '12px 16px',
+                              borderRadius: '8px',
+                              backgroundColor: '#fff1f0',
+                              border: '1px dashed #ffa39e',
+                              cursor: 'pointer'
+                            }}
+                            onClick={() => toggleSensitiveCollapse(segment.id)}
+                          >
+                            <Space>
+                              <EyeInvisibleOutlined style={{ color: '#ff4d4f' }} />
+                              <Text type="secondary" style={{ fontSize: '12px' }}>
+                                {formatTime(segment.startTime)} - {formatTime(segment.endTime)}
+                              </Text>
+                              <Tag color="red">敏感内容已折叠</Tag>
+                              <Text type="secondary" style={{ fontSize: '12px' }}>
+                                点击展开查看打码内容
+                              </Text>
+                            </Space>
+                          </div>
+                        )
+                      }
+                      
                       return (
                         <div
                           key={segment.id}
@@ -171,7 +339,7 @@ export default function MinutesEditor() {
                             padding: '16px',
                             borderRadius: '8px',
                             backgroundColor: getSegmentBg(segment),
-                            border: '1px solid #e8e8e8'
+                            border: isSensitive ? '1px solid #ffa39e' : '1px solid #e8e8e8'
                           }}
                         >
                           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
@@ -191,6 +359,17 @@ export default function MinutesEditor() {
                               </Text>
                               {segment.isHighlight && <Tag color="gold">高亮</Tag>}
                               {segment.isSensitive && <Tag color="red">敏感</Tag>}
+                              {shouldMask && (
+                                <Button
+                                  type="text"
+                                  size="small"
+                                  icon={<EyeInvisibleOutlined />}
+                                  onClick={(e) => { e.stopPropagation(); toggleSensitiveCollapse(segment.id) }}
+                                  style={{ padding: 0, height: 'auto' }}
+                                >
+                                  <Text type="secondary" style={{ fontSize: '12px' }}>折叠</Text>
+                                </Button>
+                              )}
                             </Space>
                             <Space size={4}>
                               <Button
@@ -236,7 +415,13 @@ export default function MinutesEditor() {
                               autoSize={{ minRows: 2, maxRows: 6 }}
                             />
                           ) : (
-                            <Text>{segment.content}</Text>
+                            <Text style={{ 
+                              color: shouldMask ? '#d9d9d9' : undefined,
+                              fontFamily: shouldMask ? 'monospace' : undefined,
+                              letterSpacing: shouldMask ? '2px' : undefined
+                            }}>
+                              {shouldMask ? maskSensitiveContent(segment.content) : segment.content}
+                            </Text>
                           )}
                         </div>
                       )
@@ -323,6 +508,131 @@ export default function MinutesEditor() {
           {currentMeeting?.topics.filter(t => selectedTopicIds.includes(t.id)).map(t => (
             <Tag key={t.id} color="blue" style={{ marginBottom: '4px' }}>{t.title}</Tag>
           ))}
+        </div>
+      </Modal>
+
+      <Modal
+        title="导出会议纪要"
+        open={exportModalVisible}
+        onOk={handleExport}
+        onCancel={() => setExportModalVisible(false)}
+        okText="导出"
+        cancelText="取消"
+        confirmLoading={exporting}
+        width={500}
+      >
+        <div style={{ marginBottom: 16 }}>
+          <Text strong style={{ display: 'block', marginBottom: 8 }}>
+            选择导出模板
+          </Text>
+          <Select
+            placeholder="选择模板（不选则使用通用格式）"
+            style={{ width: '100%' }}
+            value={exportTemplateId || undefined}
+            onChange={setExportTemplateId}
+            allowClear
+          >
+            {templates.map(t => (
+              <Select.Option key={t.id} value={t.id}>
+                {t.name} {t.isDefault && '(默认)'}
+              </Select.Option>
+            ))}
+          </Select>
+        </div>
+        <div style={{ marginBottom: 16 }}>
+          <Checkbox
+            checked={exportIncludeSensitive}
+            onChange={e => setExportIncludeSensitive(e.target.checked)}
+          >
+            包含敏感内容（默认不导出敏感内容）
+          </Checkbox>
+        </div>
+        <div style={{ padding: 12, backgroundColor: '#f6ffed', borderRadius: 8, border: '1px solid #b7eb8f' }}>
+          <Text type="secondary" style={{ fontSize: '12px' }}>
+            💡 导出格式：Markdown (.md)，可直接用 Typora、VS Code 等工具打开
+          </Text>
+        </div>
+      </Modal>
+
+      <Modal
+        title="发送给参会人"
+        open={sendModalVisible}
+        onOk={handleSend}
+        onCancel={() => setSendModalVisible(false)}
+        okText="发送"
+        cancelText="取消"
+        confirmLoading={sending}
+        width={500}
+      >
+        <div style={{ marginBottom: 16 }}>
+          <Text strong style={{ display: 'block', marginBottom: 8 }}>
+            会议信息
+          </Text>
+          {(() => {
+            const meeting = meetings.find(m => m.id === currentMeetingId)
+            const template = templates.find(t => t.id === sendTemplateId)
+            return (
+              <div style={{ padding: 12, backgroundColor: '#f5f5f5', borderRadius: 8 }}>
+                <div><Text type="secondary">标题：</Text>{meeting?.title}</div>
+                <div><Text type="secondary">模板：</Text>{template?.name || '通用'}</div>
+                <div><Text type="secondary">摘要：</Text>{meeting?.summary || '无'}</div>
+              </div>
+            )
+          })()}
+        </div>
+        <div style={{ marginBottom: 16 }}>
+          <Text strong style={{ display: 'block', marginBottom: 8 }}>
+            选择纪要模板
+          </Text>
+          <Select
+            placeholder="选择模板（不选则使用通用格式）"
+            style={{ width: '100%' }}
+            value={sendTemplateId || undefined}
+            onChange={setSendTemplateId}
+            allowClear
+          >
+            {templates.map(t => (
+              <Select.Option key={t.id} value={t.id}>
+                {t.name} {t.isDefault && '(默认)'}
+              </Select.Option>
+            ))}
+          </Select>
+        </div>
+        <div style={{ marginBottom: 16 }}>
+          <Text strong style={{ display: 'block', marginBottom: 8 }}>
+            选择参会人
+          </Text>
+          {(() => {
+            const meeting = meetings.find(m => m.id === currentMeetingId)
+            const allParticipants = Array.from(new Set([
+              ...(meeting?.participants || []),
+              '张三', '李四', '王五', '赵六', '钱七', '孙八'
+            ]))
+            return (
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+                {allParticipants.map(p => (
+                  <Checkbox
+                    key={p}
+                    checked={selectedParticipants.includes(p)}
+                    onChange={e => {
+                      if (e.target.checked) {
+                        setSelectedParticipants(prev => [...prev, p])
+                      } else {
+                        setSelectedParticipants(prev => prev.filter(x => x !== p))
+                      }
+                    }}
+                  >
+                    {p}
+                  </Checkbox>
+                ))}
+              </div>
+            )
+          })()}
+        </div>
+        <div style={{ padding: 12, backgroundColor: '#e6f7ff', borderRadius: 8 }}>
+          <Text type="secondary" style={{ fontSize: '12px' }}>
+            💡 将发送：会议标题、摘要、以及基于模板生成的纪要文档（自动过滤敏感内容）
+          </Text>
         </div>
       </Modal>
     </>

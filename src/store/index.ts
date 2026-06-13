@@ -50,8 +50,9 @@ interface MeetingStore {
   addCommonWord: (word: string) => void
   removeCommonWord: (word: string) => void
   
-  generateMinutesByTemplate: (meetingId: string, templateId: string) => string
-  exportMeeting: (meetingId: string, format: 'markdown' | 'docx' | 'pdf') => Promise<string>
+  generateMinutesByTemplate: (meetingId: string, templateId: string, includeSensitive?: boolean) => string
+  exportMeeting: (meetingId: string, format: 'markdown' | 'docx' | 'pdf', templateId?: string, includeSensitive?: boolean) => Promise<string>
+  sendToParticipants: (meetingId: string, participantEmails: string[], templateId?: string) => Promise<boolean>
   
   updateProcessingStatus: (status: ProcessingStatus) => void
   removeProcessingStatus: (id: string) => void
@@ -352,11 +353,15 @@ export const useMeetingStore = create<MeetingStore>()(
 
       addRealtimeSegment: (content) => {
         const { recordingTime, currentSpeakerId, realtimeTranscript } = get()
+        const lastSegment = realtimeTranscript[realtimeTranscript.length - 1]
+        const startTime = lastSegment ? lastSegment.endTime : 0
+        const endTime = Math.max(startTime + Math.min(recordingTime - startTime, 15), startTime + 3)
+        
         const newSegment: TranscriptSegment = {
           id: generateId(),
           speakerId: currentSpeakerId || 's1',
-          startTime: recordingTime - 10,
-          endTime: recordingTime,
+          startTime,
+          endTime,
           content,
           isHighlight: false,
           isSensitive: false
@@ -398,7 +403,7 @@ export const useMeetingStore = create<MeetingStore>()(
         }
       })),
 
-      generateMinutesByTemplate: (meetingId, templateId) => {
+      generateMinutesByTemplate: (meetingId, templateId, includeSensitive = false) => {
         const { meetings, templates } = get()
         const meeting = meetings.find(m => m.id === meetingId)
         const template = templates.find(t => t.id === templateId)
@@ -407,51 +412,171 @@ export const useMeetingStore = create<MeetingStore>()(
         
         let content = template.content
         
-        content = content.replace(/\{\{会议标题\}\}/g, meeting.title)
-        content = content.replace(/\{\{会议时间\}\}/g, new Date(meeting.date).toLocaleString('zh-CN'))
-        content = content.replace(/\{\{参会人员\}\}/g, meeting.participants.join('、'))
-        content = content.replace(/\{\{会议摘要\}\}/g, meeting.summary)
+        const getWeekNumber = (date: Date) => {
+          const firstDayOfYear = new Date(date.getFullYear(), 0, 1)
+          const pastDaysOfYear = (date.getTime() - firstDayOfYear.getTime()) / 86400000
+          return Math.ceil((pastDaysOfYear + firstDayOfYear.getDay() + 1) / 7)
+        }
         
-        const topicsContent = meeting.topics.map((t, i) => 
-          (i + 1) + '. ' + t.title + ': ' + t.description
-        ).join('\n\n')
-        content = content.replace(/\{\{讨论议题\}\}/g, topicsContent)
+        const meetingDate = new Date(meeting.date)
+        const weekStart = new Date(meetingDate)
+        weekStart.setDate(meetingDate.getDate() - meetingDate.getDay() + 1)
+        const weekEnd = new Date(weekStart)
+        weekEnd.setDate(weekStart.getDate() + 6)
+        const weekNumber = getWeekNumber(meetingDate)
         
-        const tasksContent = meeting.tasks.map((t, i) => {
-          const priority = t.priority === 'high' ? '高' : t.priority === 'medium' ? '中' : '低'
-          return (i + 1) + '. [' + priority + '优先级] ' + t.title + ' - 负责人: ' + t.assignee + ', 截止日期: ' + t.deadline
-        }).join('\n\n')
-        content = content.replace(/\{\{待办事项\}\}/g, tasksContent)
+        const formatDate = (date: Date) => date.toLocaleDateString('zh-CN')
         
-        content = content.replace(/\{\{附件\}\}/g, meeting.audioFile || '无')
+        const filterSensitive = (text: string) => {
+          if (includeSensitive) return text
+          return text.replace(/[\u4e00-\u9fa5a-zA-Z0-9]/g, '*')
+        }
+        
+        const getTranscriptContent = (includeSen: boolean) => {
+          return meeting.transcript
+            .filter(s => includeSen || !s.isSensitive)
+            .map(s => {
+              const speaker = s.speakerId === 's1' ? '张三' : s.speakerId === 's2' ? '李四' : '王五'
+              const cont = s.isSensitive && !includeSen ? filterSensitive(s.content) : s.content
+              return `${speaker}：${cont}`
+            })
+            .join('\n\n')
+        }
+        
+        const fillPlaceholder = (value: string, hint: string) => {
+          if (value && value.trim()) return value
+          return `【待补充：${hint}】`
+        }
+        
+        const commonData: Record<string, string> = {
+          '会议标题': fillPlaceholder(meeting.title, '请输入会议标题'),
+          '会议时间': new Date(meeting.date).toLocaleString('zh-CN'),
+          '参会人员': meeting.participants.length > 0 ? meeting.participants.join('、') : '【待补充：参会人员名单】',
+          '会议摘要': fillPlaceholder(meeting.summary, '请补充会议摘要'),
+          '附件': meeting.audioFile || '无',
+          '项目名称': fillPlaceholder(meeting.title.replace(/会议|评审|讨论/g, ''), '请输入项目名称'),
+          '周次': weekNumber.toString(),
+          '汇报周期': `${formatDate(weekStart)} 至 ${formatDate(weekEnd)}`,
+          '本周完成': meeting.topics.length > 0 
+            ? meeting.topics.map((t, i) => `${i + 1}. ${t.title}：${t.description || '【待补充详情】'}`).join('\n\n')
+            : '【待补充：本周完成的工作内容】',
+          '遇到的问题': '【待补充：本周遇到的问题和风险】',
+          '下周计划': meeting.tasks.length > 0
+            ? meeting.tasks.filter(t => t.status !== 'completed').map((t, i) => `${i + 1}. ${t.title} - 负责人：${t.assignee}`).join('\n\n')
+            : '【待补充：下周的工作计划】',
+          '协调事项': '【待补充：需要协调的资源和事项】',
+          '产品名称': fillPlaceholder(meeting.title.replace(/评审|讨论|会议/g, ''), '请输入产品名称'),
+          '评审时间': new Date(meeting.date).toLocaleString('zh-CN'),
+          '需求概述': fillPlaceholder(meeting.summary, '请补充需求概述'),
+          '评审意见': '【待补充：评审意见和建议】',
+          '修改建议': '【待补充：具体修改建议】',
+          '结论': '【待补充：评审结论（通过/修改后重审/拒绝）】',
+          '后续行动': meeting.tasks.length > 0
+            ? meeting.tasks.map((t, i) => `${i + 1}. ${t.title} - 负责人：${t.assignee}，截止：${t.deadline}`).join('\n\n')
+            : '【待补充：后续行动计划】',
+          '方案名称': fillPlaceholder(meeting.title.replace(/评审|讨论|会议/g, ''), '请输入方案名称'),
+          '方案概述': fillPlaceholder(meeting.summary, '请补充方案概述'),
+          '技术选型': '【待补充：技术选型说明】',
+          '风险评估': '【待补充：风险评估和应对措施】',
+          '评审结论': '【待补充：评审结论（通过/修改后重审/拒绝）】',
+          '后续工作': meeting.tasks.length > 0
+            ? meeting.tasks.map((t, i) => `${i + 1}. ${t.title} - 负责人：${t.assignee}，截止：${t.deadline}`).join('\n\n')
+            : '【待补充：后续工作安排】',
+          '讨论议题': meeting.topics.length > 0
+            ? meeting.topics.map((t, i) => `${i + 1}. ${t.title}\n\n${t.description || '【待补充议题详情】'}`).join('\n\n')
+            : '【待补充：讨论的议题内容】',
+          '待办事项': meeting.tasks.length > 0
+            ? meeting.tasks.map((t, i) => {
+                const priority = t.priority === 'high' ? '高' : t.priority === 'medium' ? '中' : '低'
+                const status = t.status === 'completed' ? '已完成' : t.status === 'in-progress' ? '进行中' : '待处理'
+                return `${i + 1}. [${priority}优先级] [${status}] ${t.title}\n   负责人：${t.assignee}\n   截止日期：${t.deadline}`
+              }).join('\n\n')
+            : '【待补充：待办事项列表】',
+          '转写内容': getTranscriptContent(includeSensitive) || '【待补充：会议转写内容】'
+        }
+        
+        Object.keys(commonData).forEach(key => {
+          const regex = new RegExp(`\\{\\{${key}\\}\\}`, 'g')
+          content = content.replace(regex, commonData[key])
+        })
+        
+        const remainingVars = content.match(/\{\{[^}]+\}\}/g) || []
+        remainingVars.forEach(v => {
+          const varName = v.replace(/\{\{|\}\}/g, '')
+          content = content.replace(v, `【待补充：${varName}】`)
+        })
         
         return content
       },
 
-      exportMeeting: async (meetingId, _format) => {
+      exportMeeting: async (meetingId, _format, templateId, includeSensitive = false) => {
         await new Promise(resolve => setTimeout(resolve, 800))
-        const { meetings } = get()
+        const { meetings, generateMinutesByTemplate } = get()
         const meeting = meetings.find(m => m.id === meetingId)
         if (!meeting) return ''
+        
+        if (templateId) {
+          const content = generateMinutesByTemplate(meetingId, templateId, includeSensitive)
+          return content
+        }
+        
+        const filterSensitive = (text: string) => {
+          if (includeSensitive) return text
+          return text.replace(/[\u4e00-\u9fa5a-zA-Z0-9]/g, '*')
+        }
         
         let content = '# ' + meeting.title + '\n\n'
         content += '时间: ' + new Date(meeting.date).toLocaleString('zh-CN') + '\n\n'
         content += '参会人员: ' + meeting.participants.join('、') + '\n\n'
         content += '---\n\n'
-        content += '## 会议摘要\n\n' + meeting.summary + '\n\n'
+        content += '## 会议摘要\n\n' + (meeting.summary || '【待补充：会议摘要】') + '\n\n'
+        content += '---\n\n'
+        content += '## 转写内容\n\n'
+        meeting.transcript.forEach(segment => {
+          if (!includeSensitive && segment.isSensitive) return
+          const speaker = segment.speakerId === 's1' ? '张三' : segment.speakerId === 's2' ? '李四' : '王五'
+          const segContent = segment.isSensitive && !includeSensitive ? filterSensitive(segment.content) : segment.content
+          content += `**${speaker}**：${segContent}\n\n`
+        })
         content += '---\n\n'
         content += '## 讨论议题\n\n'
-        meeting.topics.forEach(topic => {
-          content += '### ' + topic.title + '\n\n' + topic.description + '\n\n'
-        })
+        if (meeting.topics.length === 0) {
+          content += '【待补充：讨论的议题内容】\n\n'
+        } else {
+          meeting.topics.forEach(topic => {
+            content += '### ' + topic.title + '\n\n' + (topic.description || '【待补充议题详情】') + '\n\n'
+          })
+        }
         content += '---\n\n'
         content += '## 待办事项\n\n'
-        meeting.tasks.forEach(task => {
-          const status = task.status === 'completed' ? 'x' : ' '
-          content += '- [' + status + '] ' + task.title + ' - ' + task.assignee + ' (' + task.deadline + ')\n'
-        })
+        if (meeting.tasks.length === 0) {
+          content += '【待补充：待办事项列表】\n\n'
+        } else {
+          meeting.tasks.forEach(task => {
+            const status = task.status === 'completed' ? 'x' : ' '
+            content += '- [' + status + '] ' + task.title + ' - ' + task.assignee + ' (' + task.deadline + ')\n'
+          })
+        }
         
         return content
+      },
+
+      sendToParticipants: async (meetingId, participantEmails, templateId) => {
+        await new Promise(resolve => setTimeout(resolve, 1500))
+        const { meetings, generateMinutesByTemplate } = get()
+        const meeting = meetings.find(m => m.id === meetingId)
+        if (!meeting) return false
+        
+        const content = templateId 
+          ? generateMinutesByTemplate(meetingId, templateId, false)
+          : null
+        
+        console.log('发送会议纪要给:', participantEmails)
+        console.log('会议标题:', meeting.title)
+        console.log('会议摘要:', meeting.summary)
+        if (content) console.log('纪要内容:', content)
+        
+        return true
       },
 
       updateProcessingStatus: (status) => set((state) => {
